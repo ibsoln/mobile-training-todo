@@ -19,7 +19,6 @@ import android.os.AsyncTask;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
-
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.UiThread;
@@ -27,6 +26,7 @@ import androidx.annotation.WorkerThread;
 
 import java.net.URI;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -66,9 +66,17 @@ public final class DAO {
     }
 
     private static class LogoutTask extends AsyncTask<Database, Void, Void> {
+        private final boolean deleting;
+
+        public LogoutTask(boolean deleting) { this.deleting = deleting; }
+
         @Override
         protected Void doInBackground(Database... dbs) {
-            for (Database db : dbs) { DAO.get().closeDatabase(db); }
+            final DAO dao = DAO.get();
+            for (Database db: dbs) {
+                if (deleting) { dao.deleteDatabase(db); }
+                else { dao.closeDatabase(db); }
+            }
             return null;
         }
     }
@@ -123,7 +131,7 @@ public final class DAO {
             this.errors = new ArrayList<>();
         }
 
-        for (CouchbaseLiteException err : errors) { deliverError(listener, err); }
+        for (CouchbaseLiteException err: errors) { deliverError(listener, err); }
         deliverNewState(listener, replicatorState);
     }
 
@@ -173,7 +181,7 @@ public final class DAO {
         final List<ListenerToken> listeners = changeListeners.get(query);
         if (listeners == null) { return; }
 
-        for (ListenerToken token : listeners) { query.removeChangeListener(token); }
+        for (ListenerToken token: listeners) { query.removeChangeListener(token); }
 
         listeners.clear();
     }
@@ -181,11 +189,11 @@ public final class DAO {
     @UiThread
     public void removeAllChangeListeners() {
         verifyUIThread();
-        for (Query query : changeListeners.keySet()) { removeChangeListeners(query); }
+        for (Query query: changeListeners.keySet()) { removeChangeListeners(query); }
     }
 
     @WorkerThread
-    public void login(@NonNull String username, @NonNull String password) {
+    public void login(@NonNull String username, @NonNull char[] password) {
         verifyNotUIThread();
 
         if (!open.compareAndSet(false, true)) { return; }
@@ -201,10 +209,13 @@ public final class DAO {
     }
 
     @UiThread
-    public void logout() {
+    public void logout() { logout(false); }
+
+    @UiThread
+    public void logout(boolean deleteDb) {
         final Database db = shutdownDatabase();
         newInstance();
-        if (db != null) { new LogoutTask().execute(db); }
+        if (db != null) { new LogoutTask(deleteDb).execute(db); }
     }
 
     // Called from the UI thread only once, in ToDo.onTerminate()
@@ -262,7 +273,10 @@ public final class DAO {
         verifyNotUIThread();
         final Database db = getAndVerifyDb();
 
-        try { db.delete(fetch(docId)); }
+        try {
+            final Document doc = fetch(docId);
+            if (doc != null) { db.delete(doc); }
+        }
         catch (CouchbaseLiteException e) { reportError(e); }
     }
 
@@ -302,21 +316,22 @@ public final class DAO {
 
     // forceShutdown calls this from the UI thread.  Nobody else should.
     private void closeDatabase(Database db) {
-        for (int i = 0; i < 5; i++) {
-            try {
-                db.close();
-                return;
-            }
-            catch (CouchbaseLiteException e) {
-                if (e.getCode() == CBLError.Code.BUSY) {
-                    try { Thread.sleep(200); }
-                    catch (InterruptedException ignore) { }
-                    continue;
-                }
+        try {
+            db.close();
+            Log.e(TAG, "Database closed");
+        }
+        catch (CouchbaseLiteException e) {
+            Log.e(TAG, "Failed to close database: " + db.getName(), e);
+        }
+    }
 
-                reportError(e);
-                break;
-            }
+    private void deleteDatabase(Database db) {
+        try {
+            db.delete();
+            Log.e(TAG, "Database deleted");
+        }
+        catch (CouchbaseLiteException e) {
+            Log.e(TAG, "Failed to delete database: " + db.getName(), e);
         }
     }
 
@@ -324,7 +339,7 @@ public final class DAO {
     // Replicator operations
     // -------------------------
     @WorkerThread
-    private void startReplication(@NonNull String username, @NonNull String password) {
+    private void startReplication(@NonNull String username, @NonNull char[] password) {
         final Database db = getAndVerifyDb();
 
         final URI sgUri = getReplicationUri(username);
@@ -338,7 +353,8 @@ public final class DAO {
             .setContinuous(true);
 
         // authentication
-        config.setAuthenticator(new BasicAuthenticator(username, password));
+        config.setAuthenticator(new BasicAuthenticator(username, new String(password)));
+        Arrays.fill(password, ' ');
 
         final Config.CcrState ccrState = Config.get().getCcrState();
         if (ccrState != Config.CcrState.OFF) {
@@ -349,7 +365,7 @@ public final class DAO {
 
         replicator.addChangeListener(this::changed);
 
-        replicator.start();
+        replicator.start(false);
 
         this.replicator = replicator;
     }
@@ -371,8 +387,7 @@ public final class DAO {
     @Nullable
     private URI getReplicationUri(@NonNull String username) {
         try { return URI.create(Config.get().getSgUri()).normalize(); }
-        catch (IllegalArgumentException ignore) { }
-
+        catch (IllegalArgumentException e) { Log.d(TAG, "Login failed", e); }
         reportError(new CouchbaseLiteException(
             "Invalid SG URI",
             CBLError.Domain.CBLITE,
@@ -385,6 +400,7 @@ public final class DAO {
         if (!Config.get().isSyncEnabled()) { return; }
         final Replicator repl = replicator;
         if (repl != null) { repl.stop(); }
+        Log.i(TAG, "Replicator stopped");
     }
 
     private void reportError(@NonNull CouchbaseLiteException err) {
@@ -420,11 +436,11 @@ public final class DAO {
     }
 
     // always deliver state asynchronously, on the main thread
-    private void deliverNewState(
-        @NonNull DAOListener listener,
-        @NonNull AbstractReplicator.ActivityLevel state) {
-        if (Config.get().isSyncEnabled()) { return; }
-        mainHandler.post(() -> listener.onNewState(state));
+    private void deliverNewState(@NonNull DAOListener listener, @NonNull AbstractReplicator.ActivityLevel state) {
+        mainHandler.post(
+            () -> listener.onNewState((Config.get().isSyncEnabled())
+                ? state
+                : AbstractReplicator.ActivityLevel.OFFLINE));
     }
 
     private void verifyNotUIThread() {

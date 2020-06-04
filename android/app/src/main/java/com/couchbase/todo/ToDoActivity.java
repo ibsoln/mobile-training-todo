@@ -21,7 +21,6 @@ import android.view.Menu;
 import android.view.MenuItem;
 import android.view.Window;
 import android.widget.Toast;
-
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.appcompat.app.AppCompatActivity;
@@ -71,6 +70,13 @@ public abstract class ToDoActivity extends AppCompatActivity {
 
         if (item.getItemId() == R.id.config) {
             ConfigActivity.start(this);
+            return true;
+        }
+
+        if (item.getItemId() == R.id.delete) {
+            DAO.get().logout(true);
+            LoginActivity.start(this);
+            finish();
             return true;
         }
 
