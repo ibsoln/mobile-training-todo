@@ -19,7 +19,6 @@ import android.os.AsyncTask;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
-
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.UiThread;
@@ -66,9 +65,17 @@ public final class DAO {
     }
 
     private static class LogoutTask extends AsyncTask<Database, Void, Void> {
+        private final boolean deleting;
+
+        public LogoutTask(boolean deleting) { this.deleting = deleting; }
+
         @Override
         protected Void doInBackground(Database... dbs) {
-            for (Database db : dbs) { DAO.get().closeDatabase(db); }
+            final DAO dao = DAO.get();
+            for (Database db: dbs) {
+                if (deleting) { dao.deleteDatabase(db); }
+                else { dao.closeDatabase(db); }
+            }
             return null;
         }
     }
@@ -123,7 +130,7 @@ public final class DAO {
             this.errors = new ArrayList<>();
         }
 
-        for (CouchbaseLiteException err : errors) { deliverError(listener, err); }
+        for (CouchbaseLiteException err: errors) { deliverError(listener, err); }
         deliverNewState(listener, replicatorState);
     }
 
@@ -173,7 +180,7 @@ public final class DAO {
         final List<ListenerToken> listeners = changeListeners.get(query);
         if (listeners == null) { return; }
 
-        for (ListenerToken token : listeners) { query.removeChangeListener(token); }
+        for (ListenerToken token: listeners) { query.removeChangeListener(token); }
 
         listeners.clear();
     }
@@ -181,7 +188,7 @@ public final class DAO {
     @UiThread
     public void removeAllChangeListeners() {
         verifyUIThread();
-        for (Query query : changeListeners.keySet()) { removeChangeListeners(query); }
+        for (Query query: changeListeners.keySet()) { removeChangeListeners(query); }
     }
 
     @WorkerThread
@@ -201,10 +208,13 @@ public final class DAO {
     }
 
     @UiThread
-    public void logout() {
+    public void logout() { logout(false); }
+
+    @UiThread
+    public void logout(boolean deleteDb) {
         final Database db = shutdownDatabase();
         newInstance();
-        if (db != null) { new LogoutTask().execute(db); }
+        if (db != null) { new LogoutTask(deleteDb).execute(db); }
     }
 
     // Called from the UI thread only once, in ToDo.onTerminate()
@@ -262,7 +272,10 @@ public final class DAO {
         verifyNotUIThread();
         final Database db = getAndVerifyDb();
 
-        try { db.delete(fetch(docId)); }
+        try {
+            final Document doc = fetch(docId);
+            if (doc != null) { db.delete(doc); }
+        }
         catch (CouchbaseLiteException e) { reportError(e); }
     }
 
@@ -320,6 +333,10 @@ public final class DAO {
         }
     }
 
+    private void deleteDatabase(Database db) {
+        Log.e(TAG, "Failed to delete database: " + db.getName());
+    }
+
     // -------------------------
     // Replicator operations
     // -------------------------
@@ -371,8 +388,7 @@ public final class DAO {
     @Nullable
     private URI getReplicationUri(@NonNull String username) {
         try { return URI.create(Config.get().getSgUri()).normalize(); }
-        catch (IllegalArgumentException ignore) { }
-
+        catch (IllegalArgumentException e) { Log.d(TAG, "Login failed", e); }
         reportError(new CouchbaseLiteException(
             "Invalid SG URI",
             CBLError.Domain.CBLITE,
@@ -385,6 +401,7 @@ public final class DAO {
         if (!Config.get().isSyncEnabled()) { return; }
         final Replicator repl = replicator;
         if (repl != null) { repl.stop(); }
+        Log.i(TAG, "Replicator stopped");
     }
 
     private void reportError(@NonNull CouchbaseLiteException err) {
@@ -420,11 +437,11 @@ public final class DAO {
     }
 
     // always deliver state asynchronously, on the main thread
-    private void deliverNewState(
-        @NonNull DAOListener listener,
-        @NonNull AbstractReplicator.ActivityLevel state) {
-        if (Config.get().isSyncEnabled()) { return; }
-        mainHandler.post(() -> listener.onNewState(state));
+    private void deliverNewState(@NonNull DAOListener listener, @NonNull AbstractReplicator.ActivityLevel state) {
+        mainHandler.post(
+            () -> listener.onNewState((Config.get().isSyncEnabled())
+                ? state
+                : AbstractReplicator.ActivityLevel.OFFLINE));
     }
 
     private void verifyNotUIThread() {
